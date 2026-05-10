@@ -236,6 +236,24 @@ export default function stepByStep(pi: ExtensionAPI) {
 				return;
 			}
 
+			// Offer to commit the step
+			try {
+				const { stdout: statusOut } = await pi.exec("git", ["status", "--porcelain"]);
+				if (statusOut.trim()) {
+					const shouldCommit = await ctx.ui.confirm(
+						"Commit?",
+						`Commit step ${stepNum} before moving on?`,
+					);
+					if (shouldCommit) {
+						await pi.exec("git", ["add", "-A"]);
+						await pi.exec("git", ["commit", "-m", `step ${stepNum}: ${steps.topic}`]);
+						ctx.ui.notify(`Committed step ${stepNum}.`, "success");
+					}
+				}
+			} catch {
+				// Not a git repo or git not available — skip silently
+			}
+
 			const nextStepMessage = `Let's move on to step ${steps.currentStep} of ${steps.totalSteps}. Read the current project files and build the next increment.`;
 
 			// Only compact if context is above 50% of the window
