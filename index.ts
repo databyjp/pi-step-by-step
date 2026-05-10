@@ -14,12 +14,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 type State = "idle" | "planning" | "stepping" | "reviewing";
 
+interface PlanStep {
+	title: string;
+	status: "pending" | "done" | "skipped" | "redundant";
+}
+
 interface StepState {
 	state: State;
 	topic: string;
-	totalSteps: number;
+	plan: PlanStep[];
 	currentStep: number;
-	completedSteps: number[];
 }
 
 // --- Default state ---
@@ -28,10 +32,24 @@ function defaultState(): StepState {
 	return {
 		state: "idle",
 		topic: "",
-		totalSteps: 0,
+		plan: [],
 		currentStep: 0,
-		completedSteps: [],
 	};
+}
+
+// --- Helpers ---
+
+function currentStepTitle(steps: StepState): string {
+	const step = steps.plan[steps.currentStep - 1];
+	return step ? step.title : `Step ${steps.currentStep}`;
+}
+
+function remainingStepsList(steps: StepState): string {
+	return steps.plan
+		.map((s, i) => ({ ...s, num: i + 1 }))
+		.filter((s) => s.num > steps.currentStep && s.status === "pending")
+		.map((s) => `  ${s.num}. ${s.title}`)
+		.join("\n");
 }
 
 // --- System prompts per state ---
@@ -59,7 +77,17 @@ Example for "build a web API":
 
 Do NOT write any code. Just describe the steps.
 
-End your plan with: [STEPS: N] where N is the total number of steps.`,
+After your numbered list, output EXACTLY this JSON block (no other JSON in your response):
+
+\`\`\`step-by-step-plan
+[
+  "Short title for step 1",
+  "Short title for step 2",
+  "Short title for step 3"
+]
+\`\`\`
+
+Each title should be a brief summary (under 60 characters) of that step. This is parsed by the extension.`,
 
 	stepping: (s, skills?: string[]) => {
 		let skillInstruction: string;
@@ -69,23 +97,32 @@ End your plan with: [STEPS: N] where N is the total number of steps.`,
 			skillInstruction = "1. No skills are currently available — proceed with your own knowledge.";
 		}
 
-		return `[STEP-BY-STEP MODE — STEP ${s.currentStep}/${s.totalSteps}]
+		const remaining = remainingStepsList(s);
+
+		return `[STEP-BY-STEP MODE — STEP ${s.currentStep}/${s.plan.length}]
 
 The user is building: "${s.topic}"
 
-This is step ${s.currentStep} of ${s.totalSteps}. Do the following:
+Current step: ${s.currentStep}. ${currentStepTitle(s)}
+${remaining ? `\nRemaining steps:\n${remaining}\n` : ""}
+Do the following:
 
 ${skillInstruction}
 2. Use the ls and read tools to examine the current project directory and files. You MUST do this — do not rely on conversation history or assumptions about what exists. The conversation may have been compacted.
 3. Write the code for JUST this step — the next small increment. Keep it minimal.
 4. Explain what you did and why — what does this step add, and what design choices did you make?
 
+If this step is no longer needed — because it was already covered by a previous step, or the project has moved past it — say so clearly and recommend the user skip it with /step-by-step:skip. Do not try to force a redundant step to fit.
+
 The user will review your work, discuss it with you, and may ask you to adjust it before moving on.`;
 	},
 
-	reviewing: (s) => `[STEP-BY-STEP MODE — REVIEWING step ${s.currentStep}/${s.totalSteps}]
+	reviewing: (s) => {
+		const remaining = remainingStepsList(s);
 
-The user is reviewing step ${s.currentStep}: "${s.topic}"
+		return `[STEP-BY-STEP MODE — REVIEWING step ${s.currentStep}/${s.plan.length}]
+
+The user is reviewing step ${s.currentStep} (${currentStepTitle(s)}): "${s.topic}"
 
 The user may:
 - Ask questions about what you built and why
@@ -95,10 +132,10 @@ The user may:
 - Or simply move on
 
 Help them however they need. If they've written their own code, compare approaches and discuss tradeoffs as a peer.
+${remaining ? `\nRemaining steps:\n${remaining}\n\nReview the remaining steps. If any are now redundant — because they were already covered, or the project has moved past them — list them at the end of your response like this:\n\n[REDUNDANT: 7, 10, 12]\n\nOnly flag steps that are clearly unnecessary. If unsure, leave them in.` : ""}
 
-Also: briefly consider whether the remaining steps in the plan still make sense given what was actually built. If adjustments are needed, suggest them.
-
-IMPORTANT: Do NOT advance to the next step. Do NOT present the next step's code or instructions. The user will use /step-by-step:next when they are ready to move on. Your only job right now is to help with the CURRENT step.`,
+IMPORTANT: Do NOT advance to the next step. Do NOT present the next step's code or instructions. The user will use /step-by-step:next when they are ready to move on. Your only job right now is to help with the CURRENT step.`;
+	},
 };
 
 // --- Extension ---
@@ -115,20 +152,26 @@ export default function stepByStep(pi: ExtensionAPI) {
 			return;
 		}
 
+		const total = steps.plan.length;
+
 		// Footer status
 		const stateLabel = steps.state === "stepping" ? "building" : steps.state;
 		ctx.ui.setStatus(
 			"step-by-step",
-			ctx.ui.theme.fg("accent", `🔨 step ${steps.currentStep}/${steps.totalSteps} — ${stateLabel}`),
+			ctx.ui.theme.fg("accent", `🔨 step ${steps.currentStep}/${total} — ${stateLabel}`),
 		);
 
 		// Progress widget
 		const dots = [];
-		for (let i = 1; i <= steps.totalSteps; i++) {
-			if (steps.completedSteps.includes(i)) {
+		for (let i = 0; i < total; i++) {
+			const step = steps.plan[i];
+			const stepNum = i + 1;
+			if (step.status === "done") {
 				dots.push(ctx.ui.theme.fg("success", "●"));
-			} else if (i === steps.currentStep) {
+			} else if (stepNum === steps.currentStep) {
 				dots.push(ctx.ui.theme.fg("accent", "◐"));
+			} else if (step.status === "redundant" || step.status === "skipped") {
+				dots.push(ctx.ui.theme.fg("muted", "⊘"));
 			} else {
 				dots.push(ctx.ui.theme.fg("muted", "○"));
 			}
@@ -136,14 +179,14 @@ export default function stepByStep(pi: ExtensionAPI) {
 
 		const truncatedTopic = steps.topic.length > 40 ? steps.topic.slice(0, 37) + "..." : steps.topic;
 		ctx.ui.setWidget("step-by-step", [
-			`  🔨 ${truncatedTopic}  [${steps.currentStep}/${steps.totalSteps}]  ${dots.join(" ")}`,
+			`  🔨 ${truncatedTopic}  [${steps.currentStep}/${total}]  ${dots.join(" ")}`,
 		]);
 	}
 
 	// --- Persistence ---
 
 	function persist() {
-		pi.appendEntry("step-by-step", { ...steps });
+		pi.appendEntry("step-by-step", { ...steps, plan: [...steps.plan] });
 	}
 
 	function restore(ctx: ExtensionContext) {
@@ -165,16 +208,33 @@ export default function stepByStep(pi: ExtensionAPI) {
 		updateUI(ctx);
 	}
 
+	function markCurrentStep(status: "done" | "skipped") {
+		if (steps.currentStep >= 1 && steps.currentStep <= steps.plan.length) {
+			steps.plan[steps.currentStep - 1].status = status;
+		}
+	}
+
 	function advanceStep(ctx: ExtensionContext): boolean {
-		if (steps.currentStep >= steps.totalSteps) {
+		// Find the next pending step
+		let next = steps.currentStep + 1;
+		while (next <= steps.plan.length) {
+			const step = steps.plan[next - 1];
+			if (step.status === "redundant" || step.status === "skipped") {
+				ctx.ui.notify(`Step ${next} (${step.title}) — skipping.`, "info");
+				next++;
+			} else {
+				break;
+			}
+		}
+
+		if (next > steps.plan.length) {
 			steps.state = "idle";
-			steps.completedSteps.push(steps.currentStep);
 			persist();
 			updateUI(ctx);
 			return false;
 		}
-		steps.completedSteps.push(steps.currentStep);
-		steps.currentStep++;
+
+		steps.currentStep = next;
 		steps.state = "stepping";
 		persist();
 		updateUI(ctx);
@@ -221,6 +281,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 			}
 
 			const stepNum = steps.currentStep;
+			markCurrentStep("done");
 			const hasMore = advanceStep(ctx);
 
 			if (!hasMore) {
@@ -228,7 +289,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 				pi.sendMessage(
 					{
 						customType: "step-by-step-complete",
-						content: `**All steps complete!** 🎉\n\nYou've worked through all ${steps.totalSteps} steps of: "${steps.topic}"`,
+						content: `**All steps complete!** 🎉\n\nYou've worked through all steps of: "${steps.topic}"`,
 						display: true,
 					},
 					{ triggerTurn: false },
@@ -246,7 +307,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 					);
 					if (shouldCommit) {
 						await pi.exec("git", ["add", "-A"]);
-						await pi.exec("git", ["commit", "-m", `step ${stepNum}: ${steps.topic}`]);
+						await pi.exec("git", ["commit", "-m", `step ${stepNum}: ${currentStepTitle({ ...steps, currentStep: stepNum } as StepState)}`]);
 						ctx.ui.notify(`Committed step ${stepNum}.`, "success");
 					}
 				}
@@ -254,7 +315,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 				// Not a git repo or git not available — skip silently
 			}
 
-			const nextStepMessage = `Let's move on to step ${steps.currentStep} of ${steps.totalSteps}. Read the current project files and build the next increment.`;
+			const nextStepMessage = `Let's move on to step ${steps.currentStep}: ${currentStepTitle(steps)}. Read the current project files and build the next increment.`;
 
 			// Only compact if context is above 50% of the window
 			const usage = ctx.getContextUsage();
@@ -293,6 +354,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 			}
 
 			const skippedStep = steps.currentStep;
+			markCurrentStep("skipped");
 			const hasMore = advanceStep(ctx);
 
 			if (!hasMore) {
@@ -300,9 +362,9 @@ export default function stepByStep(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify(`Skipped step ${skippedStep}. Moving to step ${steps.currentStep}.`, "info");
+			ctx.ui.notify(`Skipped step ${skippedStep}. Moving to step ${steps.currentStep}: ${currentStepTitle(steps)}.`, "info");
 			pi.sendUserMessage(
-				`Step ${skippedStep} skipped. Let's move to step ${steps.currentStep} of ${steps.totalSteps}. Read the current project files and build the next increment.`,
+				`Step ${skippedStep} skipped. Let's move to step ${steps.currentStep}: ${currentStepTitle(steps)}. Read the current project files and build the next increment.`,
 			);
 		},
 	});
@@ -315,21 +377,30 @@ export default function stepByStep(pi: ExtensionAPI) {
 				return;
 			}
 
+			const doneCount = steps.plan.filter((s) => s.status === "done").length;
 			const lines = [
 				`🔨 Building: ${steps.topic}`,
 				`State: ${steps.state}`,
-				`Progress: step ${steps.currentStep} of ${steps.totalSteps}`,
+				`Progress: ${doneCount} done, step ${steps.currentStep} of ${steps.plan.length}`,
 				"",
-				"Steps:",
 			];
 
-			for (let i = 1; i <= steps.totalSteps; i++) {
-				const marker = steps.completedSteps.includes(i)
-					? "✅"
-					: i === steps.currentStep
-						? "👉"
-						: "  ";
-				lines.push(`  ${marker} Step ${i}`);
+			for (let i = 0; i < steps.plan.length; i++) {
+				const step = steps.plan[i];
+				const stepNum = i + 1;
+				let marker: string;
+				if (step.status === "done") {
+					marker = "✅";
+				} else if (stepNum === steps.currentStep) {
+					marker = "👉";
+				} else if (step.status === "redundant") {
+					marker = "⏭️";
+				} else if (step.status === "skipped") {
+					marker = "⏭️";
+				} else {
+					marker = "  ";
+				}
+				lines.push(`  ${marker} ${stepNum}. ${step.title}`);
 			}
 
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -342,8 +413,8 @@ export default function stepByStep(pi: ExtensionAPI) {
 		if (steps.state !== "planning") return;
 		if (!ctx.hasUI) return;
 
-		// Try to extract step count from the last assistant message
-		let extractedCount: number | null = null;
+		// Try to extract the structured plan from the last assistant message
+		let extractedPlan: string[] | null = null;
 		const messages = event.messages ?? [];
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const msg = messages[i];
@@ -352,9 +423,16 @@ export default function stepByStep(pi: ExtensionAPI) {
 					.filter((c: { type: string }) => c.type === "text")
 					.map((c: { type: string; text?: string }) => c.text ?? "")
 					.join("\n");
-				const match = text.match(/\[STEPS:\s*(\d+)\]/);
+				const match = text.match(/```step-by-step-plan\s*\n([\s\S]*?)\n```/);
 				if (match) {
-					extractedCount = Number(match[1]);
+					try {
+						const parsed = JSON.parse(match[1]);
+						if (Array.isArray(parsed) && parsed.every((s: unknown) => typeof s === "string")) {
+							extractedPlan = parsed;
+						}
+					} catch {
+						// JSON parse failed — fall through
+					}
 				}
 				break;
 			}
@@ -362,8 +440,8 @@ export default function stepByStep(pi: ExtensionAPI) {
 
 		const ok = await ctx.ui.confirm(
 			"Plan ready?",
-			extractedCount
-				? `${extractedCount} steps found. Does the plan look good? (You can chat to adjust it first)`
+			extractedPlan
+				? `${extractedPlan.length} steps found. Does the plan look good? (You can chat to adjust it first)`
 				: "Does the plan look good? (You can chat to adjust it first)",
 		);
 		if (!ok) {
@@ -371,23 +449,24 @@ export default function stepByStep(pi: ExtensionAPI) {
 			return;
 		}
 
-		let count = extractedCount;
-		if (!count) {
-			const countStr = await ctx.ui.input("How many steps?", "Enter the number of steps in the plan");
-			count = Number(countStr);
+		if (extractedPlan) {
+			steps.plan = extractedPlan.map((title) => ({ title, status: "pending" as const }));
+		} else {
+			const countStr = await ctx.ui.input("How many steps?", "Couldn't parse the plan. Enter the number of steps:");
+			const count = Number(countStr);
 			if (!count || count < 1 || !Number.isFinite(count)) {
 				ctx.ui.notify("Invalid number. Try confirming again after the next response.", "error");
 				return;
 			}
+			steps.plan = Array.from({ length: count }, (_, i) => ({ title: `Step ${i + 1}`, status: "pending" as const }));
 		}
 
-		steps.totalSteps = count;
 		steps.currentStep = 1;
 		setState("stepping", ctx);
 
-		ctx.ui.notify(`Plan confirmed with ${count} steps. Starting step 1.`, "success");
+		ctx.ui.notify(`Plan confirmed with ${steps.plan.length} steps. Starting step 1: ${currentStepTitle(steps)}.`, "success");
 		pi.sendUserMessage(
-			`Plan confirmed. Let's start with step 1 of ${count}. Read the current project files and build the first increment.`,
+			`Plan confirmed. Let's start with step 1: ${currentStepTitle(steps)}. Read the current project files and build the first increment.`,
 		);
 	});
 
@@ -419,7 +498,45 @@ export default function stepByStep(pi: ExtensionAPI) {
 		if (steps.state !== "stepping") return;
 
 		setState("reviewing", ctx);
-		ctx.ui.notify("Review this step. Discuss, adjust, or /step-by-step:next when ready.", "info");
+		ctx.ui.notify(`Review this step: ${currentStepTitle(steps)}. Discuss, adjust, or /step-by-step:next when ready.`, "info");
+	});
+
+	// --- Parse redundant step markers from REVIEWING responses ---
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (steps.state !== "reviewing") return;
+
+		const messages = event.messages ?? [];
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant" && Array.isArray(msg.content)) {
+				const text = msg.content
+					.filter((c: { type: string }) => c.type === "text")
+					.map((c: { type: string; text?: string }) => c.text ?? "")
+					.join("\n");
+				const match = text.match(/\[REDUNDANT:\s*([\d,\s]+)\]/);
+				if (match) {
+					const nums = match[1]
+						.split(",")
+						.map((s) => Number(s.trim()))
+						.filter((n) => Number.isFinite(n) && n > steps.currentStep && n <= steps.plan.length);
+					const newRedundant: number[] = [];
+					for (const n of nums) {
+						if (steps.plan[n - 1].status === "pending") {
+							steps.plan[n - 1].status = "redundant";
+							newRedundant.push(n);
+						}
+					}
+					if (newRedundant.length > 0) {
+						persist();
+						updateUI(ctx);
+						const labels = newRedundant.map((n) => `${n} (${steps.plan[n - 1].title})`);
+						ctx.ui.notify(`Steps marked as redundant: ${labels.join(", ")}`, "info");
+					}
+				}
+				break;
+			}
+		}
 	});
 
 	// --- Filter stale context messages ---
