@@ -1,9 +1,9 @@
 /**
- * Pair Learning Extension for Pi
+ * Step-by-Step Extension for Pi
  *
- * Turns Pi into a pair learning tool. Pi breaks a task into incremental steps,
- * generates reference code per step based on actual project state, then guides
- * the user through coding each step — followed by comparison and discussion.
+ * Turns Pi into a staged development tool. Pi breaks a task into incremental steps,
+ * builds each one based on actual project state, then pauses for review and discussion
+ * before moving on.
  *
  * See DESIGN.md for full architecture.
  */
@@ -12,9 +12,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 // --- Types ---
 
-type State = "idle" | "planning" | "stepping" | "coding" | "reviewing";
+type State = "idle" | "planning" | "stepping" | "reviewing";
 
-interface LearnState {
+interface StepState {
 	state: State;
 	topic: string;
 	totalSteps: number;
@@ -24,7 +24,7 @@ interface LearnState {
 
 // --- Default state ---
 
-function defaultState(): LearnState {
+function defaultState(): StepState {
 	return {
 		state: "idle",
 		topic: "",
@@ -36,10 +36,10 @@ function defaultState(): LearnState {
 
 // --- System prompts per state ---
 
-const SYSTEM_PROMPTS: Record<Exclude<State, "idle">, (s: LearnState, skills?: string[]) => string> = {
-	planning: (s) => `[LEARN MODE — PLANNING]
+const SYSTEM_PROMPTS: Record<Exclude<State, "idle">, (s: StepState, skills?: string[]) => string> = {
+	planning: (s) => `[STEP-BY-STEP MODE — PLANNING]
 
-The user wants to learn: "${s.topic}"
+The user wants to build: "${s.topic}"
 
 Break this into small, incremental steps. Output a numbered list of step descriptions ONLY — no code yet.
 
@@ -57,7 +57,9 @@ Example for "build a web API":
 3. Add a POST /items endpoint that accepts a JSON body
 ...etc.
 
-Do NOT write any code. Just describe the steps.`,
+Do NOT write any code. Just describe the steps.
+
+End your plan with: [STEPS: N] where N is the total number of steps.`,
 
 	stepping: (s, skills?: string[]) => {
 		let skillInstruction: string;
@@ -67,125 +69,113 @@ Do NOT write any code. Just describe the steps.`,
 			skillInstruction = "1. No skills are currently available — proceed with your own knowledge.";
 		}
 
-		return `[LEARN MODE — STEP ${s.currentStep}/${s.totalSteps}]
+		return `[STEP-BY-STEP MODE — STEP ${s.currentStep}/${s.totalSteps}]
 
-The user is learning: "${s.topic}"
+The user is building: "${s.topic}"
 
 This is step ${s.currentStep} of ${s.totalSteps}. Do the following:
 
 ${skillInstruction}
-2. Read the current project files to understand what exists so far.
-3. Write a reference implementation for JUST this step — the next small increment. Keep it minimal.
-4. Then, present the step to the user as a clear ENGLISH INSTRUCTION — tell them WHAT to build, not HOW. Do not repeat your reference code in the instruction.
+2. Use the ls and read tools to examine the current project directory and files. You MUST do this — do not rely on conversation history or assumptions about what exists. The conversation may have been compacted.
+3. Write the code for JUST this step — the next small increment. Keep it minimal.
+4. Explain what you did and why — what does this step add, and what design choices did you make?
 
-Format your response like this:
-
-## Reference Implementation
-(your code here — the next small increment only)
-
-## Your Turn
-(clear English description of what to build, without code)`;
+The user will review your work, discuss it with you, and may ask you to adjust it before moving on.`;
 	},
 
-	coding: (s) => `[LEARN MODE — CODING step ${s.currentStep}/${s.totalSteps}]
+	reviewing: (s) => `[STEP-BY-STEP MODE — REVIEWING step ${s.currentStep}/${s.totalSteps}]
 
-The user is working on step ${s.currentStep} of their learning project: "${s.topic}"
+The user is reviewing step ${s.currentStep}: "${s.topic}"
 
-They are writing their own implementation. Help them with ANY questions they have — syntax, concepts, debugging, "how do I do X", etc. Answer openly and directly. You are a pair partner, not an examiner.
+The user may:
+- Ask questions about what you built and why
+- Request changes or a different approach
+- Write their own version and ask you to compare
+- Discuss tradeoffs, alternatives, or patterns
+- Or simply move on
 
-Do not proactively show them the full solution unless they ask for it.`,
+Help them however they need. If they've written their own code, compare approaches and discuss tradeoffs as a peer.
 
-	reviewing: (s) => `[LEARN MODE — REVIEWING step ${s.currentStep}/${s.totalSteps}]
+Also: briefly consider whether the remaining steps in the plan still make sense given what was actually built. If adjustments are needed, suggest them.
 
-The user has submitted their implementation for step ${s.currentStep}: "${s.topic}"
-
-Compare their implementation to your reference from earlier in the conversation. Discuss:
-- Does it work correctly?
-- Any differences in approach — and the tradeoffs of each
-- Style, idioms, or patterns worth noting
-- Anything they might want to refactor
-
-Be a peer, not a grader. This is a conversation.
-
-Also: briefly consider whether the remaining steps in the plan still make sense given what was actually built. If adjustments are needed, suggest them.`,
+IMPORTANT: Do NOT advance to the next step. Do NOT present the next step's code or instructions. The user will use /step-by-step:next when they are ready to move on. Your only job right now is to help with the CURRENT step.`,
 };
 
 // --- Extension ---
 
-export default function learnMode(pi: ExtensionAPI) {
-	let learn: LearnState = defaultState();
+export default function stepByStep(pi: ExtensionAPI) {
+	let steps: StepState = defaultState();
 
 	// --- UI updates ---
 
 	function updateUI(ctx: ExtensionContext) {
-		if (learn.state === "idle") {
-			ctx.ui.setStatus("learn-mode", undefined);
-			ctx.ui.setWidget("learn-mode", undefined);
+		if (steps.state === "idle") {
+			ctx.ui.setStatus("step-by-step", undefined);
+			ctx.ui.setWidget("step-by-step", undefined);
 			return;
 		}
 
 		// Footer status
-		const stateLabel = learn.state === "stepping" ? "instruction" : learn.state;
+		const stateLabel = steps.state === "stepping" ? "building" : steps.state;
 		ctx.ui.setStatus(
-			"learn-mode",
-			ctx.ui.theme.fg("accent", `📖 step ${learn.currentStep}/${learn.totalSteps} — ${stateLabel}`),
+			"step-by-step",
+			ctx.ui.theme.fg("accent", `🔨 step ${steps.currentStep}/${steps.totalSteps} — ${stateLabel}`),
 		);
 
 		// Progress widget
 		const dots = [];
-		for (let i = 1; i <= learn.totalSteps; i++) {
-			if (learn.completedSteps.includes(i)) {
+		for (let i = 1; i <= steps.totalSteps; i++) {
+			if (steps.completedSteps.includes(i)) {
 				dots.push(ctx.ui.theme.fg("success", "●"));
-			} else if (i === learn.currentStep) {
+			} else if (i === steps.currentStep) {
 				dots.push(ctx.ui.theme.fg("accent", "◐"));
 			} else {
 				dots.push(ctx.ui.theme.fg("muted", "○"));
 			}
 		}
 
-		const truncatedTopic = learn.topic.length > 40 ? learn.topic.slice(0, 37) + "..." : learn.topic;
-		ctx.ui.setWidget("learn-mode", [
-			`  📖 ${truncatedTopic}  [${learn.currentStep}/${learn.totalSteps}]  ${dots.join(" ")}`,
+		const truncatedTopic = steps.topic.length > 40 ? steps.topic.slice(0, 37) + "..." : steps.topic;
+		ctx.ui.setWidget("step-by-step", [
+			`  🔨 ${truncatedTopic}  [${steps.currentStep}/${steps.totalSteps}]  ${dots.join(" ")}`,
 		]);
 	}
 
 	// --- Persistence ---
 
 	function persist() {
-		pi.appendEntry("learn-mode", { ...learn });
+		pi.appendEntry("step-by-step", { ...steps });
 	}
 
 	function restore(ctx: ExtensionContext) {
 		const entries = ctx.sessionManager.getEntries();
 		const last = entries
-			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "learn-mode")
-			.pop() as { data?: LearnState } | undefined;
+			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "step-by-step")
+			.pop() as { data?: StepState } | undefined;
 
 		if (last?.data) {
-			learn = { ...defaultState(), ...last.data };
+			steps = { ...defaultState(), ...last.data };
 		}
 	}
 
 	// --- State transitions ---
 
 	function setState(state: State, ctx: ExtensionContext) {
-		learn.state = state;
+		steps.state = state;
 		persist();
 		updateUI(ctx);
 	}
 
 	function advanceStep(ctx: ExtensionContext): boolean {
-		if (learn.currentStep >= learn.totalSteps) {
-			// All steps complete
-			learn.state = "idle";
-			learn.completedSteps.push(learn.currentStep);
+		if (steps.currentStep >= steps.totalSteps) {
+			steps.state = "idle";
+			steps.completedSteps.push(steps.currentStep);
 			persist();
 			updateUI(ctx);
 			return false;
 		}
-		learn.completedSteps.push(learn.currentStep);
-		learn.currentStep++;
-		learn.state = "stepping";
+		steps.completedSteps.push(steps.currentStep);
+		steps.currentStep++;
+		steps.state = "stepping";
 		persist();
 		updateUI(ctx);
 		return true;
@@ -193,74 +183,52 @@ export default function learnMode(pi: ExtensionAPI) {
 
 	// --- Commands ---
 
-	pi.registerCommand("learn:start", {
-		description: "Start a pair learning session",
+	pi.registerCommand("step-by-step:start", {
+		description: "Start a step-by-step building session",
 		handler: async (args, ctx) => {
-			if (learn.state !== "idle") {
-				ctx.ui.notify("A learning session is already active. Finish it or start a new Pi session.", "error");
+			if (steps.state !== "idle") {
+				ctx.ui.notify("A step-by-step session is already active. Finish it or start a new Pi session.", "error");
 				return;
 			}
 
 			const topic = args?.trim();
 			if (!topic) {
-				ctx.ui.notify("Usage: /learn:start <topic>", "error");
+				ctx.ui.notify("Usage: /step-by-step:start <topic>", "error");
 				return;
 			}
 
-			learn = defaultState();
-			learn.topic = topic;
-			learn.state = "planning";
+			steps = defaultState();
+			steps.topic = topic;
+			steps.state = "planning";
 			persist();
 			updateUI(ctx);
 
-			// Send a message to Pi to generate the plan
-			pi.sendUserMessage(`I want to learn how to: ${topic}\n\nPlease break this down into small, incremental steps.`);
+			pi.sendUserMessage(`I want to build: ${topic}\n\nPlease break this down into small, incremental steps.`);
 		},
 	});
 
-	pi.registerCommand("learn:submit", {
-		description: "Submit your implementation for review",
+	pi.registerCommand("step-by-step:next", {
+		description: "Finish reviewing and move to next step",
 		handler: async (_args, ctx) => {
-			if (learn.state !== "coding") {
+			if (steps.state !== "reviewing") {
 				ctx.ui.notify(
-					learn.state === "idle"
-						? "No learning session active. Use /learn:start"
-						: `Can't submit in ${learn.state} state. Expected: coding`,
+					steps.state === "idle"
+						? "No step-by-step session active. Use /step-by-step:start"
+						: `Can't advance in ${steps.state} state. Expected: reviewing`,
 					"error",
 				);
 				return;
 			}
 
-			setState("reviewing", ctx);
-
-			pi.sendUserMessage(
-				"I've finished my implementation for this step. Please review it — compare it to your reference and let's discuss.",
-			);
-		},
-	});
-
-	pi.registerCommand("learn:next", {
-		description: "Finish reviewing, compact, and move to next step",
-		handler: async (_args, ctx) => {
-			if (learn.state !== "reviewing") {
-				ctx.ui.notify(
-					learn.state === "idle"
-						? "No learning session active. Use /learn:start"
-						: `Can't advance in ${learn.state} state. Expected: reviewing`,
-					"error",
-				);
-				return;
-			}
-
-			const stepNum = learn.currentStep;
+			const stepNum = steps.currentStep;
 			const hasMore = advanceStep(ctx);
 
 			if (!hasMore) {
-				ctx.ui.notify("🎉 All steps complete! Learning session finished.", "success");
+				ctx.ui.notify("🎉 All steps complete!", "success");
 				pi.sendMessage(
 					{
-						customType: "learn-mode-complete",
-						content: `**Learning session complete!** 🎉\n\nYou've worked through all ${learn.totalSteps} steps of: "${learn.topic}"`,
+						customType: "step-by-step-complete",
+						content: `**All steps complete!** 🎉\n\nYou've worked through all ${steps.totalSteps} steps of: "${steps.topic}"`,
 						display: true,
 					},
 					{ triggerTurn: false },
@@ -268,74 +236,79 @@ export default function learnMode(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify(`Step ${stepNum} complete. Compacting and moving to step ${learn.currentStep}...`, "info");
+			const nextStepMessage = `Let's move on to step ${steps.currentStep} of ${steps.totalSteps}. Read the current project files and build the next increment.`;
 
-			// Compact, then trigger the next step
-			ctx.compact({
-				customInstructions: `Summarise what was learned in step ${stepNum}. Preserve: the step description, key differences between implementations, and decisions made. Discard: full code listings.`,
-				onComplete: () => {
-					pi.sendUserMessage(
-						`Let's move on to step ${learn.currentStep} of ${learn.totalSteps}. Read the current project files and present the next increment.`,
-					);
-				},
-				onError: (err) => {
-					ctx.ui.notify(`Compaction failed: ${err.message}. Continuing anyway.`, "error");
-					pi.sendUserMessage(
-						`Let's move on to step ${learn.currentStep} of ${learn.totalSteps}. Read the current project files and present the next increment.`,
-					);
-				},
-			});
+			// Only compact if context is above 50% of the window
+			const usage = ctx.getContextUsage();
+			const shouldCompact = usage && usage.contextWindow > 0 && usage.tokens > usage.contextWindow * 0.5;
+
+			if (shouldCompact) {
+				ctx.ui.notify(`Step ${stepNum} complete. Compacting and moving to step ${steps.currentStep}...`, "info");
+				ctx.compact({
+					customInstructions: `Summarise step ${stepNum}. Preserve: what was built, key design decisions, and any concerns raised. Discard: full code listings.`,
+					onComplete: () => {
+						pi.sendUserMessage(nextStepMessage);
+					},
+					onError: (err) => {
+						ctx.ui.notify(`Compaction failed: ${err.message}. Continuing anyway.`, "error");
+						pi.sendUserMessage(nextStepMessage);
+					},
+				});
+			} else {
+				ctx.ui.notify(`Step ${stepNum} complete. Moving to step ${steps.currentStep}...`, "info");
+				pi.sendUserMessage(nextStepMessage);
+			}
 		},
 	});
 
-	pi.registerCommand("learn:skip", {
+	pi.registerCommand("step-by-step:skip", {
 		description: "Skip the current step",
 		handler: async (_args, ctx) => {
-			if (learn.state !== "stepping" && learn.state !== "coding") {
+			if (steps.state !== "stepping" && steps.state !== "reviewing") {
 				ctx.ui.notify(
-					learn.state === "idle"
-						? "No learning session active. Use /learn:start"
-						: `Can't skip in ${learn.state} state. Expected: stepping or coding`,
+					steps.state === "idle"
+						? "No step-by-step session active. Use /step-by-step:start"
+						: `Can't skip in ${steps.state} state. Expected: stepping or reviewing`,
 					"error",
 				);
 				return;
 			}
 
-			const skippedStep = learn.currentStep;
+			const skippedStep = steps.currentStep;
 			const hasMore = advanceStep(ctx);
 
 			if (!hasMore) {
-				ctx.ui.notify("That was the last step. Learning session finished.", "success");
+				ctx.ui.notify("That was the last step. Session finished.", "success");
 				return;
 			}
 
-			ctx.ui.notify(`Skipped step ${skippedStep}. Moving to step ${learn.currentStep}.`, "info");
+			ctx.ui.notify(`Skipped step ${skippedStep}. Moving to step ${steps.currentStep}.`, "info");
 			pi.sendUserMessage(
-				`Step ${skippedStep} skipped. Let's move to step ${learn.currentStep} of ${learn.totalSteps}. Read the current project files and present the next increment.`,
+				`Step ${skippedStep} skipped. Let's move to step ${steps.currentStep} of ${steps.totalSteps}. Read the current project files and build the next increment.`,
 			);
 		},
 	});
 
-	pi.registerCommand("learn:show-plan", {
-		description: "Show the learning plan and progress",
+	pi.registerCommand("step-by-step:show-plan", {
+		description: "Show the plan and progress",
 		handler: async (_args, ctx) => {
-			if (learn.state === "idle") {
-				ctx.ui.notify("No learning session active. Use /learn:start", "error");
+			if (steps.state === "idle") {
+				ctx.ui.notify("No step-by-step session active. Use /step-by-step:start", "error");
 				return;
 			}
 
 			const lines = [
-				`📖 Learning: ${learn.topic}`,
-				`State: ${learn.state}`,
-				`Progress: step ${learn.currentStep} of ${learn.totalSteps}`,
+				`🔨 Building: ${steps.topic}`,
+				`State: ${steps.state}`,
+				`Progress: step ${steps.currentStep} of ${steps.totalSteps}`,
 				"",
 				"Steps:",
 			];
 
-			for (let i = 1; i <= learn.totalSteps; i++) {
-				const marker = learn.completedSteps.includes(i)
+			for (let i = 1; i <= steps.totalSteps; i++) {
+				const marker = steps.completedSteps.includes(i)
 					? "✅"
-					: i === learn.currentStep
+					: i === steps.currentStep
 						? "👉"
 						: "  ";
 				lines.push(`  ${marker} Step ${i}`);
@@ -347,39 +320,65 @@ export default function learnMode(pi: ExtensionAPI) {
 
 	// --- Plan confirmation (after PLANNING, before first step) ---
 
-	pi.on("agent_end", async (_event, ctx) => {
-		if (learn.state !== "planning") return;
+	pi.on("agent_end", async (event, ctx) => {
+		if (steps.state !== "planning") return;
 		if (!ctx.hasUI) return;
 
-		const ok = await ctx.ui.confirm("Plan ready?", "Does the plan look good? (You can chat to adjust it first)");
+		// Try to extract step count from the last assistant message
+		let extractedCount: number | null = null;
+		const messages = event.messages ?? [];
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg.role === "assistant" && Array.isArray(msg.content)) {
+				const text = msg.content
+					.filter((c: { type: string }) => c.type === "text")
+					.map((c: { type: string; text?: string }) => c.text ?? "")
+					.join("\n");
+				const match = text.match(/\[STEPS:\s*(\d+)\]/);
+				if (match) {
+					extractedCount = Number(match[1]);
+				}
+				break;
+			}
+		}
+
+		const ok = await ctx.ui.confirm(
+			"Plan ready?",
+			extractedCount
+				? `${extractedCount} steps found. Does the plan look good? (You can chat to adjust it first)`
+				: "Does the plan look good? (You can chat to adjust it first)",
+		);
 		if (!ok) {
 			ctx.ui.notify("Keep chatting to adjust the plan, then confirm when ready.", "info");
 			return;
 		}
 
-		const countStr = await ctx.ui.input("How many steps?", "Enter the number of steps in the plan");
-		const count = Number(countStr);
-		if (!count || count < 1 || !Number.isFinite(count)) {
-			ctx.ui.notify("Invalid number. Try confirming again after the next response.", "error");
-			return;
+		let count = extractedCount;
+		if (!count) {
+			const countStr = await ctx.ui.input("How many steps?", "Enter the number of steps in the plan");
+			count = Number(countStr);
+			if (!count || count < 1 || !Number.isFinite(count)) {
+				ctx.ui.notify("Invalid number. Try confirming again after the next response.", "error");
+				return;
+			}
 		}
 
-		learn.totalSteps = count;
-		learn.currentStep = 1;
+		steps.totalSteps = count;
+		steps.currentStep = 1;
 		setState("stepping", ctx);
 
 		ctx.ui.notify(`Plan confirmed with ${count} steps. Starting step 1.`, "success");
 		pi.sendUserMessage(
-			`Plan confirmed. Let's start with step 1 of ${count}. Read the current project files and present the first increment.`,
+			`Plan confirmed. Let's start with step 1 of ${count}. Read the current project files and build the first increment.`,
 		);
 	});
 
 	// --- System prompt injection ---
 
 	pi.on("before_agent_start", async (event) => {
-		if (learn.state === "idle") return;
+		if (steps.state === "idle") return;
 
-		const promptFn = SYSTEM_PROMPTS[learn.state];
+		const promptFn = SYSTEM_PROMPTS[steps.state];
 		if (!promptFn) return;
 
 		// Extract available skill names for the stepping prompt
@@ -387,36 +386,32 @@ export default function learnMode(pi: ExtensionAPI) {
 			(s: { name?: string }) => s.name,
 		).filter(Boolean) as string[] | undefined;
 
-		const content = typeof promptFn === "function" && promptFn.length > 1
-			? (promptFn as (s: LearnState, skills?: string[]) => string)(learn, skills)
-			: (promptFn as (s: LearnState) => string)(learn);
-
 		return {
 			message: {
-				customType: "learn-mode-context",
-				content,
+				customType: "step-by-step-context",
+				content: promptFn(steps, skills),
 				display: false,
 			},
 		};
 	});
 
-	// --- Transition from STEPPING to CODING after Pi presents the step ---
+	// --- Transition from STEPPING to REVIEWING after Pi presents the step ---
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (learn.state !== "stepping") return;
+		if (steps.state !== "stepping") return;
 
-		setState("coding", ctx);
-		ctx.ui.notify("Your turn! Write your implementation, then /learn:submit when done.", "info");
+		setState("reviewing", ctx);
+		ctx.ui.notify("Review this step. Discuss, adjust, or /step-by-step:next when ready.", "info");
 	});
 
-	// --- Filter stale learn-mode context messages ---
+	// --- Filter stale context messages ---
 
 	pi.on("context", async (event) => {
-		if (learn.state === "idle") {
+		if (steps.state === "idle") {
 			return {
 				messages: event.messages.filter((m) => {
 					const msg = m as { customType?: string };
-					return msg.customType !== "learn-mode-context";
+					return msg.customType !== "step-by-step-context";
 				}),
 			};
 		}
