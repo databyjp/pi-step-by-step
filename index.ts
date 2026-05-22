@@ -449,17 +449,12 @@ export default function stepByStep(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (extractedPlan) {
-			steps.plan = extractedPlan.map((title) => ({ title, status: "pending" as const }));
-		} else {
-			const countStr = await ctx.ui.input("How many steps?", "Couldn't parse the plan. Enter the number of steps:");
-			const count = Number(countStr);
-			if (!count || count < 1 || !Number.isFinite(count)) {
-				ctx.ui.notify("Invalid number. Try confirming again after the next response.", "error");
-				return;
-			}
-			steps.plan = Array.from({ length: count }, (_, i) => ({ title: `Step ${i + 1}`, status: "pending" as const }));
+		if (!extractedPlan) {
+			ctx.ui.notify("Couldn't parse the step plan from the response. Ask Pi to restate the plan, then confirm again.", "error");
+			return;
 		}
+
+		steps.plan = extractedPlan.map((title) => ({ title, status: "pending" as const }));
 
 		steps.currentStep = 1;
 		setState("stepping", ctx);
@@ -467,6 +462,7 @@ export default function stepByStep(pi: ExtensionAPI) {
 		ctx.ui.notify(`Plan confirmed with ${steps.plan.length} steps. Starting step 1: ${currentStepTitle(steps)}.`, "success");
 		pi.sendUserMessage(
 			`Plan confirmed. Let's start with step 1: ${currentStepTitle(steps)}. Read the current project files and build the first increment.`,
+			{ streamingBehavior: "followUp" },
 		);
 	});
 
